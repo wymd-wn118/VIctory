@@ -3146,6 +3146,20 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
 }
 
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
+/// found no window of its own takes: the first that begins at or below the
+/// ask — and no lower than `lowest` — and holds all of it. The ask's own
+/// (start, len) was already looked for, so a window that holds the ask
+/// serves it rather than a second copy being made: an unsized ask and a
+/// sized one in the same cell name different lengths, and without this the
+/// same title memory was copied once for each (a third of every window's
+/// bytes in a run).
+fn holder_below(windows: impl Iterator<Item = (u64, u64)>, lowest: u64, address: u64, end: u64) -> Option<(u64, u64)> {
+    windows
+        .filter(|&(start, bytes)| start >= lowest && start <= address && start + bytes >= end)
+        .min()
+}
+
+/// Of `windows` (start, bytes), the one an ask of `[address, end)` that
 /// may take any window takes ([`find_any`]): the longest that holds the
 /// whole range.
 fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> Option<(u64, u64)> {
@@ -3228,6 +3242,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // No window at exactly this (start, len). One already alive may hold the
+    // whole ask: an unsized ask and a sized one in the same cell name
+    // different lengths, so the same title memory was copied into a second
+    // window — a third of the bytes of every window in a run (34-38%: 2496 MB
+    // of windows over 1636 MB of title memory). A window that holds the ask
+    // serves it, and nothing is copied twice for it.
+    let holding = holder_below(map.keys().copied(), start, address, end).and_then(|k| map.get(&k).cloned());
+    if let Some(shadow) = holding {
+        note(&shadow);
+        return Some(shadow);
+    }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
@@ -3275,7 +3300,40 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, grid, holder, holder_below, longest_tail, tail_of, window_of};
+
+    /// An ask that found no window of its own takes one that holds all of
+    /// it: the longest the two kinds of ask make in one cell differ, so
+    /// without this the same title memory was copied once for each.
+    #[test]
+    fn an_ask_takes_a_window_that_holds_it() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x9_0000, cell + 0xb_0000);
+        let lowest = cell;
+        assert_eq!(holder_below([].into_iter(), lowest, ask, end), None);
+        let there = [
+            (cell, 0x4_0000),             // ends below the ask
+            (cell + 0x8_0000, 0x2_0000),  // holds its first half only
+            (cell + 0x8_0000, 0x4_0000),  // holds it
+            (cell + 0x4_0000, 0x10_0000), // holds it, lower down
+            (cell + 0xa_0000, 0x40_0000), // begins above it
+        ];
+        // The first that begins at or below the ask and holds it all.
+        assert_eq!(holder_below(there.into_iter(), lowest, ask, end), Some((cell + 0x4_0000, 0x10_0000)));
+        // None below `lowest`, however well it holds the ask.
+        assert_eq!(holder_below(there.into_iter(), cell + 0x8_0000, ask, end), Some((cell + 0x8_0000, 0x4_0000)));
+    }
+
+    /// An ask takes no window that begins below the lowest it may take, and
+    /// none that ends in the middle of it.
+    #[test]
+    fn a_window_must_begin_no_lower_than_the_ask_allows() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x2_0000, cell + 0x3_0000);
+        let there = [(cell, 0x10_0000), (cell + 0x1_0000, 0x10_0000)];
+        assert_eq!(holder_below(there.into_iter(), cell + 0x1_0000, ask, end), Some((cell + 0x1_0000, 0x10_0000)));
+        assert_eq!(holder_below(there.into_iter(), cell + 0x2_0000, ask, end), None);
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
